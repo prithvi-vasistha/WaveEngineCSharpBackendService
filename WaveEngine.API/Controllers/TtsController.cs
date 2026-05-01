@@ -101,6 +101,68 @@ public class TtsController : ControllerBase
     }
 
     /// <summary>
+    /// Decodes a Base64-encoded WAV from an OrchestrationResult and returns it as a playable audio/wav file.
+    /// Use ?target=final_mix for the complete mixed track, or ?target={segmentId} for a single segment.
+    /// </summary>
+    [HttpPost("decode-audio")]
+    [Produces("audio/wav")]
+    [ProducesResponseType(typeof(FileContentResult), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public IActionResult DecodeAudio(
+        [FromBody] OrchestrationResult result,
+        [FromQuery] string target = "final_mix")
+    {
+        _log.LogInformation("POST /decode-audio — target='{Target}'", target);
+
+        string base64;
+        string filename;
+
+        if (string.Equals(target, "final_mix", StringComparison.OrdinalIgnoreCase))
+        {
+            if (string.IsNullOrWhiteSpace(result.FinalMixWavBase64))
+                return BadRequest(new { error = "final_mix_wav_base64 is empty in the supplied payload." });
+
+            base64   = result.FinalMixWavBase64;
+            filename = $"{result.Script?.ProjectId ?? "project"}_final_mix.wav";
+        }
+        else
+        {
+            var segment = result.SegmentAudio?.FirstOrDefault(
+                s => string.Equals(s.SegmentId, target, StringComparison.OrdinalIgnoreCase));
+
+            if (segment is null)
+                return NotFound(new
+                {
+                    error = $"Segment '{target}' not found.",
+                    available = result.SegmentAudio?.Select(s => s.SegmentId).ToArray() ?? [],
+                });
+
+            if (string.IsNullOrWhiteSpace(segment.WavBase64))
+                return BadRequest(new { error = $"wav_base64 is empty for segment '{target}'." });
+
+            base64   = segment.WavBase64;
+            filename = $"{target}.wav";
+        }
+
+        byte[] wavBytes;
+        try
+        {
+            wavBytes = Convert.FromBase64String(base64);
+        }
+        catch (FormatException ex)
+        {
+            _log.LogError(ex, "POST /decode-audio — Base64 decode failed for target='{Target}'", target);
+            return BadRequest(new { error = $"The Base64 value for '{target}' is not valid: {ex.Message}" });
+        }
+
+        _log.LogInformation(
+            "POST /decode-audio — returning {Bytes} bytes as '{File}'", wavBytes.Length, filename);
+
+        return File(wavBytes, "audio/wav", filename);
+    }
+
+    /// <summary>
     /// Full pipeline: generate script → synthesize each segment → normalize duration.
     /// Returns the narration script JSON plus all normalized segment WAVs as Base64.
     /// </summary>

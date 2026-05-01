@@ -30,6 +30,7 @@ public static class ServiceExtensions
         });
 
         services.AddSingleton<IAudioNormalizationService, AudioNormalizationService>();
+        services.AddSingleton<IAudioAssemblyService, AudioAssemblyService>();
         services.AddScoped<ITtsOrchestrationService, TtsOrchestrationService>();
 
         // Configure FFMpegCore binary path (override via config for non-PATH installs)

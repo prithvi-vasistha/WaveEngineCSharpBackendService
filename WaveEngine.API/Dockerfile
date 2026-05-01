@@ -16,4 +16,6 @@ RUN dotnet publish "WaveEngine.API/WaveEngine.API.csproj" -c Release -o /app/pub
 
 FROM base AS runtime
 COPY --from=build /app/publish .
+# Copy background music assets — the server resolves track filenames from this folder
+COPY assets/ /app/assets/
 ENTRYPOINT ["dotnet", "WaveEngine.API.dll"]

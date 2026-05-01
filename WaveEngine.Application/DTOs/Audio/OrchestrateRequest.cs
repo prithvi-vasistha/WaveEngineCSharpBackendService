@@ -13,4 +13,10 @@ public class OrchestrateRequest
     /// Must match the provider used to generate the script.
     /// </summary>
     public AiConfigDto AiConfig { get; set; } = new();
+
+    /// <summary>
+    /// Optional background music to layer underneath the narration.
+    /// Omit or set TrackFileName to null for no background music.
+    /// </summary>
+    public BackgroundMusicConfig? BackgroundMusic { get; set; }
 }

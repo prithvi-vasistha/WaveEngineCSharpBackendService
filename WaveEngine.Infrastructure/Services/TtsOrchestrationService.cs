@@ -15,17 +15,20 @@ public class TtsOrchestrationService : ITtsOrchestrationService
     private readonly IScriptGenerationService _scriptService;
     private readonly ITtsSynthesisService _synthesisService;
     private readonly IAudioNormalizationService _normalizationService;
+    private readonly IAudioAssemblyService _assemblyService;
     private readonly ILogger<TtsOrchestrationService> _log;
 
     public TtsOrchestrationService(
         IScriptGenerationService scriptService,
         ITtsSynthesisService synthesisService,
         IAudioNormalizationService normalizationService,
+        IAudioAssemblyService assemblyService,
         ILogger<TtsOrchestrationService> log)
     {
         _scriptService = scriptService;
         _synthesisService = synthesisService;
         _normalizationService = normalizationService;
+        _assemblyService = assemblyService;
         _log = log;
     }
 
@@ -39,22 +42,45 @@ public class TtsOrchestrationService : ITtsOrchestrationService
             "Orchestration: synthesizing {Count} segments for project '{Id}'",
             script.Segments.Count, script.ProjectId);
 
-        var segmentResults = new List<SegmentAudioResult>(script.Segments.Count);
+        // Phase 1 — synthesize + normalize each segment, keeping raw WAV bytes for assembly
+        var segmentResults  = new List<SegmentAudioResult>(script.Segments.Count);
+        var assemblyInputs  = new List<SegmentAudioAssemblyInput>(script.Segments.Count);
 
         foreach (var segment in script.Segments)
         {
-            var result = await ProcessSegmentAsync(segment, request.AiConfig, ct);
+            var (result, rawWav) = await ProcessSegmentAsync(segment, request.AiConfig, ct);
             segmentResults.Add(result);
+            assemblyInputs.Add(new SegmentAudioAssemblyInput
+            {
+                SegmentId        = segment.Id,
+                StartTimeSeconds = segment.StartTimeSeconds,
+                WavBytes         = rawWav,
+            });
         }
+
+        // Phase 2 — assemble all segments into a single mixed audio track
+        double totalDuration = script.Segments.Max(s => (double)s.EndTimeSeconds);
+
+        _log.LogInformation(
+            "Orchestration: assembling final mix — totalDuration={Duration:F2}s, track='{Track}'",
+            totalDuration, request.BackgroundMusic?.TrackFileName ?? "none");
+
+        var finalMixWav = await _assemblyService.AssembleAsync(
+            assemblyInputs, request.BackgroundMusic, totalDuration, ct);
 
         return new OrchestrationResult
         {
-            Script = script,
-            SegmentAudio = segmentResults,
+            Script          = script,
+            SegmentAudio    = segmentResults,
+            FinalMixWavBase64 = Convert.ToBase64String(finalMixWav),
         };
     }
 
-    private async Task<SegmentAudioResult> ProcessSegmentAsync(
+    /// <summary>
+    /// Synthesizes, normalizes (with rewrite retry), and returns the DTO + raw WAV bytes.
+    /// Raw bytes are kept separate to avoid a Base64 encode→decode round-trip for assembly.
+    /// </summary>
+    private async Task<(SegmentAudioResult Dto, byte[] RawWav)> ProcessSegmentAsync(
         Segment segment,
         AiConfigDto aiConfig,
         CancellationToken ct)
@@ -79,7 +105,7 @@ public class TtsOrchestrationService : ITtsOrchestrationService
                     _log.LogInformation(
                         "Segment {Id}: normalized successfully after {N} rewrite(s).", segment.Id, attempt);
 
-                return ToSegmentResult(normResult);
+                return (ToSegmentResult(segment, normResult), normResult.WavBytes);
             }
             catch (SegmentOverSizedException ex)
             {
@@ -96,7 +122,7 @@ public class TtsOrchestrationService : ITtsOrchestrationService
                     var hardCapResult = await _normalizationService.ApplyHardCapAsync(
                         rawWav, ex.ActualDuration, ex.TargetDuration, segment.Id, ct);
 
-                    return ToSegmentResult(hardCapResult);
+                    return (ToSegmentResult(segment, hardCapResult), hardCapResult.WavBytes);
                 }
 
                 _log.LogWarning(
@@ -163,14 +189,15 @@ public class TtsOrchestrationService : ITtsOrchestrationService
         }
     }
 
-    private static SegmentAudioResult ToSegmentResult(AudioNormalizationResult n) =>
+    private static SegmentAudioResult ToSegmentResult(Segment segment, AudioNormalizationResult n) =>
         new()
         {
-            SegmentId = n.SegmentId,
-            ActualDuration = n.ActualDuration,
-            TargetDuration = n.TargetDuration,
-            ActionTaken = n.ActionTaken,
-            SpeedFactor = n.SpeedFactor,
-            WavBase64 = Convert.ToBase64String(n.WavBytes),
+            SegmentId        = n.SegmentId,
+            StartTimeSeconds = segment.StartTimeSeconds,
+            ActualDuration   = n.ActualDuration,
+            TargetDuration   = n.TargetDuration,
+            ActionTaken      = n.ActionTaken,
+            SpeedFactor      = n.SpeedFactor,
+            WavBase64        = Convert.ToBase64String(n.WavBytes),
         };
 }
