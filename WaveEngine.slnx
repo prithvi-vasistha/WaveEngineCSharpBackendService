@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="WaveEngine.API/WaveEngine.API.csproj" />
+  <Project Path="WaveEngine.Application/WaveEngine.Application.csproj" />
+  <Project Path="WaveEngine.Domain/WaveEngine.Domain.csproj" />
+  <Project Path="WaveEngine.Infrastructure/WaveEngine.Infrastructure.csproj" />
+</Solution>
