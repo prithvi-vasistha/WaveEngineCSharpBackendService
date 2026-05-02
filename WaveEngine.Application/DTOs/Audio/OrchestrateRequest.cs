@@ -19,4 +19,12 @@ public class OrchestrateRequest
     /// Omit or set TrackFileName to null for no background music.
     /// </summary>
     public BackgroundMusicConfig? BackgroundMusic { get; set; }
+
+    /// <summary>
+    /// Duration of the source video in seconds.
+    /// When provided, the background music loop is extended to cover the full video
+    /// rather than stopping at the end of the last narration segment.
+    /// Omit (or pass null / 0) to fall back to the segment-based duration.
+    /// </summary>
+    public double? VideoDurationSeconds { get; set; }
 }

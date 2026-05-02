@@ -1,9 +1,34 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.Http.Features;
 using WaveEngine.Infrastructure;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// ── Large-file upload limits (video ingestion up to 500 MB) ────────────────
+// Kestrel: controls the raw HTTP request body limit
+builder.WebHost.ConfigureKestrel(kestrel =>
+{
+    kestrel.Limits.MaxRequestBodySize = 524_288_000; // 500 MB
+});
+
+// FormOptions: controls the multipart body parser limit (must match Kestrel)
+builder.Services.Configure<FormOptions>(form =>
+{
+    form.MultipartBodyLengthLimit = 524_288_000; // 500 MB
+});
+// ───────────────────────────────────────────────────────────────────────────
+
+// ── CORS — allow the WaveEngineUI dev server and any local origin ──────────
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(policy =>
+        policy.SetIsOriginAllowed(_ => true)   // dev-only: allow all origins
+              .AllowAnyHeader()
+              .AllowAnyMethod());
+});
+// ───────────────────────────────────────────────────────────────────────────
 
 builder.Services.AddControllers()
     .AddJsonOptions(options =>
@@ -52,6 +77,8 @@ if (app.Environment.IsDevelopment())
     app.UseSwagger();
     app.UseSwaggerUI();
 }
+
+app.UseCors();
 
 // Lightweight liveness probe used by Docker healthcheck and load balancers
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));

@@ -38,6 +38,11 @@ public class TtsOrchestrationService : ITtsOrchestrationService
     {
         var script = request.Script;
 
+        if (script.Segments is not { Count: > 0 })
+            throw new ArgumentException(
+                "request.script.segments is empty or missing. " +
+                "Ensure the NarrationScript is nested under the \"script\" key in the request body.");
+
         _log.LogInformation(
             "Orchestration: synthesizing {Count} segments for project '{Id}'",
             script.Segments.Count, script.ProjectId);
@@ -59,11 +64,20 @@ public class TtsOrchestrationService : ITtsOrchestrationService
         }
 
         // Phase 2 — assemble all segments into a single mixed audio track
-        double totalDuration = script.Segments.Max(s => (double)s.EndTimeSeconds);
+        //
+        // Background music should loop for the full video length, not just until the last
+        // narration segment ends — so prefer video_duration_seconds when the caller provides it.
+        double segmentDuration = script.Segments.Max(s => (double)s.EndTimeSeconds);
+        double totalDuration   = request.VideoDurationSeconds is > 0
+            ? request.VideoDurationSeconds.Value
+            : segmentDuration;
 
         _log.LogInformation(
-            "Orchestration: assembling final mix — totalDuration={Duration:F2}s, track='{Track}'",
-            totalDuration, request.BackgroundMusic?.TrackFileName ?? "none");
+            "Orchestration: assembling final mix — totalDuration={Duration:F2}s " +
+            "(segmentMax={SegMax:F2}s, videoDuration={Vid}) track='{Track}'",
+            totalDuration, segmentDuration,
+            request.VideoDurationSeconds?.ToString("F2") ?? "not provided",
+            request.BackgroundMusic?.TrackFileName ?? "none");
 
         var finalMixWav = await _assemblyService.AssembleAsync(
             assemblyInputs, request.BackgroundMusic, totalDuration, ct);
