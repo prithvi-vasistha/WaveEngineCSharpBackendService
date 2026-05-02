@@ -53,6 +53,9 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
+// Lightweight liveness probe used by Docker healthcheck and load balancers
+app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+
 app.MapControllers();
 
 app.Run();
