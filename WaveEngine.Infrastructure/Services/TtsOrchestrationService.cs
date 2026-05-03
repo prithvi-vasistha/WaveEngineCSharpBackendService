@@ -51,9 +51,14 @@ public class TtsOrchestrationService : ITtsOrchestrationService
         var segmentResults  = new List<SegmentAudioResult>(script.Segments.Count);
         var assemblyInputs  = new List<SegmentAudioAssemblyInput>(script.Segments.Count);
 
+        if (!string.IsNullOrWhiteSpace(request.VoiceOverride))
+            _log.LogInformation(
+                "Orchestration: voice_override='{Voice}' — all segments will use this voice.",
+                request.VoiceOverride);
+
         foreach (var segment in script.Segments)
         {
-            var (result, rawWav) = await ProcessSegmentAsync(segment, request.AiConfig, ct);
+            var (result, rawWav) = await ProcessSegmentAsync(segment, request.AiConfig, request.VoiceOverride, ct);
             segmentResults.Add(result);
             assemblyInputs.Add(new SegmentAudioAssemblyInput
             {
@@ -97,15 +102,17 @@ public class TtsOrchestrationService : ITtsOrchestrationService
     private async Task<(SegmentAudioResult Dto, byte[] RawWav)> ProcessSegmentAsync(
         Segment segment,
         AiConfigDto aiConfig,
+        string? voiceOverride,
         CancellationToken ct)
     {
         _log.LogInformation(
-            "Segment {Id}: synthesizing (target={Duration:F1}s)",
-            segment.Id, segment.TargetDuration);
+            "Segment {Id}: synthesizing (target={Duration:F1}s, voice={Voice})",
+            segment.Id, segment.TargetDuration,
+            voiceOverride ?? segment.TtsConfig.Voice);
 
         // Initial synthesize
         var currentScript = segment.Script;
-        var rawWav = await SynthesizeAsync(segment, currentScript, ct);
+        var rawWav = await SynthesizeAsync(segment, currentScript, voiceOverride, ct);
 
         // Attempt normalization — retry with rewrite if oversized
         for (int attempt = 0; attempt <= MaxRewriteRetries; attempt++)
@@ -146,7 +153,7 @@ public class TtsOrchestrationService : ITtsOrchestrationService
 
                 // Rewrite the script shorter and re-synthesize
                 (currentScript, rawWav) = await RewriteAndSynthesizeAsync(
-                    segment, currentScript, aiConfig, ct);
+                    segment, currentScript, aiConfig, voiceOverride, ct);
             }
         }
 
@@ -159,6 +166,7 @@ public class TtsOrchestrationService : ITtsOrchestrationService
         Segment segment,
         string currentScript,
         AiConfigDto aiConfig,
+        string? voiceOverride,
         CancellationToken ct)
     {
         var rewriteRequest = new RewriteShorterRequest
@@ -178,17 +186,22 @@ public class TtsOrchestrationService : ITtsOrchestrationService
             rewritten.WordCount,
             rewritten.MaxWordCount);
 
-        var newWav = await SynthesizeAsync(segment, rewritten.RewrittenScript, ct);
+        var newWav = await SynthesizeAsync(segment, rewritten.RewrittenScript, voiceOverride, ct);
         return (rewritten.RewrittenScript, newWav);
     }
 
-    private async Task<byte[]> SynthesizeAsync(Segment segment, string scriptText, CancellationToken ct)
+    private async Task<byte[]> SynthesizeAsync(
+        Segment segment,
+        string scriptText,
+        string? voiceOverride,
+        CancellationToken ct)
     {
         var request = new SynthesizeRequest
         {
             Text = scriptText,
             Filename = $"{segment.Id}.wav",
-            Voice = segment.TtsConfig.Voice,
+            // voiceOverride wins when set — ensures consistent voice across all segments
+            Voice = voiceOverride ?? segment.TtsConfig.Voice,
             Speed = segment.TtsConfig.Speed,
         };
 

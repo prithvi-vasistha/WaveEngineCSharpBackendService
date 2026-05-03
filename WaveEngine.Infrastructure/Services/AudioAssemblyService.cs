@@ -199,8 +199,10 @@ public class AudioAssemblyService : IAudioAssemblyService
             sb.Append($"[s{i}]");
 
         int inputCount = 1 + segments.Count;
-        // dropout_transition=0 — no fade-in/out when streams end
-        sb.Append($"amix=inputs={inputCount}:dropout_transition=0[mix]");
+        // normalize=0 — each stream keeps its own volume; without this amix divides
+        // every input (including narration) by inputCount, making the volume knob
+        // affect narration levels as well as background music.
+        sb.Append($"amix=inputs={inputCount}:dropout_transition=0:normalize=0[mix]");
 
         return sb.ToString();
     }

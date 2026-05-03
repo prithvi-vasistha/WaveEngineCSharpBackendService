@@ -27,4 +27,13 @@ public class OrchestrateRequest
     /// Omit (or pass null / 0) to fall back to the segment-based duration.
     /// </summary>
     public double? VideoDurationSeconds { get; set; }
+
+    /// <summary>
+    /// When set, overrides the TTS voice for every segment, ignoring whatever voice
+    /// the LLM placed in each segment's tts_config. Ensures a consistent voice
+    /// throughout the entire narration.
+    /// Common values: "af_heart" (female), "am_adam" (male).
+    /// Omit to use each segment's own tts_config.voice (LLM-chosen, may vary).
+    /// </summary>
+    public string? VoiceOverride { get; set; }
 }

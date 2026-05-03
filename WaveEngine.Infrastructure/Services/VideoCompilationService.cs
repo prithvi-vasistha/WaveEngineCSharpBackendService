@@ -91,7 +91,7 @@ public class VideoCompilationService : IVideoCompilationService
             // This preserves ambient sound / original music beneath the voice-over.
             var filterComplex =
                 "[0:a]aformat=sample_rates=44100:channel_layouts=stereo,volume=0.15[orig_ducked];" +
-                "[orig_ducked][1:a]amix=inputs=2:dropout_transition=0[audio_out]";
+                "[orig_ducked][1:a]amix=inputs=2:dropout_transition=0:normalize=0[audio_out]";
 
             args.AddRange(["-filter_complex", filterComplex]);
             args.AddRange(["-map", "0:v", "-map", "[audio_out]"]);
