@@ -1,8 +1,11 @@
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using WaveEngine.Application.DTOs.Audio;
+using WaveEngine.Application.DTOs.Pipeline;
 using WaveEngine.Application.DTOs.Script;
 using WaveEngine.Application.DTOs.Synthesize;
 using WaveEngine.Application.Interfaces;
+using WaveEngine.Application.Settings;
 using WaveEngine.Domain.Entities;
 using WaveEngine.Domain.Exceptions;
 
@@ -10,8 +13,7 @@ namespace WaveEngine.Infrastructure.Services;
 
 public class TtsOrchestrationService : ITtsOrchestrationService
 {
-    private const int MaxRewriteRetries = 2;
-
+    private readonly OrchestrationSettings _settings;
     private readonly IScriptGenerationService _scriptService;
     private readonly ITtsSynthesisService _synthesisService;
     private readonly IAudioNormalizationService _normalizationService;
@@ -19,12 +21,14 @@ public class TtsOrchestrationService : ITtsOrchestrationService
     private readonly ILogger<TtsOrchestrationService> _log;
 
     public TtsOrchestrationService(
+        IOptions<OrchestrationSettings> settings,
         IScriptGenerationService scriptService,
         ITtsSynthesisService synthesisService,
         IAudioNormalizationService normalizationService,
         IAudioAssemblyService assemblyService,
         ILogger<TtsOrchestrationService> log)
     {
+        _settings = settings.Value;
         _scriptService = scriptService;
         _synthesisService = synthesisService;
         _normalizationService = normalizationService;
@@ -43,35 +47,51 @@ public class TtsOrchestrationService : ITtsOrchestrationService
                 "request.script.segments is empty or missing. " +
                 "Ensure the NarrationScript is nested under the \"script\" key in the request body.");
 
-        _log.LogInformation(
-            "Orchestration: synthesizing {Count} segments for project '{Id}'",
-            script.Segments.Count, script.ProjectId);
+        int parallelism = Math.Max(1, _settings.MaxTtsParallelism);
 
-        // Phase 1 — synthesize + normalize each segment, keeping raw WAV bytes for assembly
-        var segmentResults  = new List<SegmentAudioResult>(script.Segments.Count);
-        var assemblyInputs  = new List<SegmentAudioAssemblyInput>(script.Segments.Count);
+        _log.LogInformation(
+            "Orchestration: synthesizing {Count} segments for project '{Id}' " +
+            "(tolerance=±{Tol:F2}s, maxSpeedFactor={Factor:F2}x, maxRetries={Retries}, parallelism={P})",
+            script.Segments.Count, script.ProjectId,
+            _settings.ToleranceSeconds, _settings.MaxSpeedFactor,
+            _settings.MaxRetryAttempts, parallelism);
 
         if (!string.IsNullOrWhiteSpace(request.VoiceOverride))
             _log.LogInformation(
                 "Orchestration: voice_override='{Voice}' — all segments will use this voice.",
                 request.VoiceOverride);
 
-        foreach (var segment in script.Segments)
+        // ── Phase 1: Parallel segment synthesis ───────────────────────────────
+        //
+        // A linked CTS lets any segment with a FATAL error cancel all siblings.
+        // Non-fatal errors (duration validation failures after all retries) are
+        // swallowed inside ProcessSegmentAsync — they never reach this level.
+        using var fatalCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        using var semaphore = new SemaphoreSlim(parallelism, parallelism);
+
+        // Allocate result slots so we can preserve segment ordering.
+        var orderedResults   = new (SegmentAudioResult Dto, byte[] RawWav)[script.Segments.Count];
+        var assemblyInputs   = new SegmentAudioAssemblyInput[script.Segments.Count];
+
+        var tasks = script.Segments.Select((segment, index) =>
+            SynthesizeWithSemaphoreAsync(
+                semaphore, segment, index, request.AiConfig, request.VoiceOverride,
+                orderedResults, assemblyInputs, fatalCts, fatalCts.Token));
+
+        try
         {
-            var (result, rawWav) = await ProcessSegmentAsync(segment, request.AiConfig, request.VoiceOverride, ct);
-            segmentResults.Add(result);
-            assemblyInputs.Add(new SegmentAudioAssemblyInput
-            {
-                SegmentId        = segment.Id,
-                StartTimeSeconds = segment.StartTimeSeconds,
-                WavBytes         = rawWav,
-            });
+            await Task.WhenAll(tasks);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Triggered by fatalCts — a segment threw a fatal exception.
+            // The real exception was already logged inside the task.
+            throw new InvalidOperationException(
+                "One or more segment synthesis tasks failed with a fatal error. " +
+                "The pipeline has been aborted.");
         }
 
-        // Phase 2 — assemble all segments into a single mixed audio track
-        //
-        // Background music should loop for the full video length, not just until the last
-        // narration segment ends — so prefer video_duration_seconds when the caller provides it.
+        // ── Phase 2: Audio assembly ───────────────────────────────────────────
         double segmentDuration = script.Segments.Max(s => (double)s.EndTimeSeconds);
         double totalDuration   = request.VideoDurationSeconds is > 0
             ? request.VideoDurationSeconds.Value
@@ -89,15 +109,77 @@ public class TtsOrchestrationService : ITtsOrchestrationService
 
         return new OrchestrationResult
         {
-            Script          = script,
-            SegmentAudio    = segmentResults,
+            Script            = script,
+            SegmentAudio      = orderedResults.Select(r => r.Dto).ToList(),
             FinalMixWavBase64 = Convert.ToBase64String(finalMixWav),
         };
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Semaphore wrapper — acquires a slot, runs the segment, releases the slot.
+    // Fatal exceptions (not duration-validation failures) cancel all siblings.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private async Task SynthesizeWithSemaphoreAsync(
+        SemaphoreSlim semaphore,
+        Segment segment,
+        int index,
+        AiConfigDto aiConfig,
+        string? voiceOverride,
+        (SegmentAudioResult Dto, byte[] RawWav)[] results,
+        SegmentAudioAssemblyInput[] assemblyInputs,
+        CancellationTokenSource fatalCts,
+        CancellationToken ct)
+    {
+        await semaphore.WaitAsync(ct);
+        try
+        {
+            var (dto, rawWav) = await ProcessSegmentAsync(
+                segment, aiConfig, voiceOverride, ct);
+
+            results[index] = (dto, rawWav);
+            assemblyInputs[index] = new SegmentAudioAssemblyInput
+            {
+                SegmentId        = segment.Id,
+                StartTimeSeconds = segment.StartTimeSeconds,
+                WavBytes         = rawWav,
+            };
+        }
+        catch (OperationCanceledException)
+        {
+            // Propagate cancellation (either caller or sibling fatal error).
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Fatal synthesis error — cancel all other running/pending segments.
+            _log.LogError(ex,
+                "Segment {Id}: FATAL error during synthesis. " +
+                "Cancelling all remaining segments.",
+                segment.Id);
+
+            fatalCts.Cancel();
+            throw;
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Per-segment synthesis loop
+    // ─────────────────────────────────────────────────────────────────────────
+
     /// <summary>
-    /// Synthesizes, normalizes (with rewrite retry), and returns the DTO + raw WAV bytes.
-    /// Raw bytes are kept separate to avoid a Base64 encode→decode round-trip for assembly.
+    /// Synthesizes one segment, applies audio normalization (atempo up to MaxSpeedFactor),
+    /// and runs the LLM-rewrite retry loop:
+    ///   CASE A (too long)  → RewriteShorterAsync → re-synthesize
+    ///   CASE B (too short) → RewriteLongerAsync  → re-synthesize
+    ///
+    /// This method ALWAYS returns a result (never throws for duration-validation failures).
+    /// After MaxRetryAttempts the attempt with the smallest absolute delta is used
+    /// with a best-effort fallback atempo. Any other exception propagates as fatal.
     /// </summary>
     private async Task<(SegmentAudioResult Dto, byte[] RawWav)> ProcessSegmentAsync(
         Segment segment,
@@ -106,16 +188,17 @@ public class TtsOrchestrationService : ITtsOrchestrationService
         CancellationToken ct)
     {
         _log.LogInformation(
-            "Segment {Id}: synthesizing (target={Duration:F1}s, voice={Voice})",
+            "Segment {Id}: starting synthesis loop (target={Duration:F1}s, voice={Voice})",
             segment.Id, segment.TargetDuration,
             voiceOverride ?? segment.TtsConfig.Voice);
 
-        // Initial synthesize
         var currentScript = segment.Script;
         var rawWav = await SynthesizeAsync(segment, currentScript, voiceOverride, ct);
 
-        // Attempt normalization — retry with rewrite if oversized
-        for (int attempt = 0; attempt <= MaxRewriteRetries; attempt++)
+        // Tracks every attempt that failed normalization so we can select the best one.
+        var failedAttempts = new List<SegmentSynthesisAttempt>();
+
+        for (int attempt = 0; attempt <= _settings.MaxRetryAttempts; attempt++)
         {
             try
             {
@@ -124,71 +207,131 @@ public class TtsOrchestrationService : ITtsOrchestrationService
 
                 if (attempt > 0)
                     _log.LogInformation(
-                        "Segment {Id}: normalized successfully after {N} rewrite(s).", segment.Id, attempt);
+                        "Segment {Id}: accepted after {N} rewrite(s). action={Action} speedFactor={Factor:F4}x",
+                        segment.Id, attempt, normResult.ActionTaken, normResult.SpeedFactor);
 
                 return (ToSegmentResult(segment, normResult), normResult.WavBytes);
             }
             catch (SegmentOverSizedException ex)
             {
-                if (attempt == MaxRewriteRetries)
-                {
-                    // All retries exhausted — apply hard-cap and move on
-                    _log.LogWarning(
-                        "⚠️  Segment {Id}: HARD-CAP FALLBACK after {N} rewrite attempts. " +
-                        "actual={Actual:F2}s, target={Target:F2}s, factor={Factor:F2}x. " +
-                        "Audio will bleed. Review script word count for this segment.",
-                        ex.SegmentId, MaxRewriteRetries,
-                        ex.ActualDuration, ex.TargetDuration, ex.SpeedFactor);
-
-                    var hardCapResult = await _normalizationService.ApplyHardCapAsync(
-                        rawWav, ex.ActualDuration, ex.TargetDuration, segment.Id, ct);
-
-                    return (ToSegmentResult(segment, hardCapResult), hardCapResult.WavBytes);
-                }
-
+                // CASE A — audio is too long even at MaxSpeedFactor: need a shorter script
                 _log.LogWarning(
-                    "Segment {Id}: oversized (factor={Factor:F2}x). " +
-                    "Rewrite attempt {Attempt}/{Max} …",
-                    ex.SegmentId, ex.SpeedFactor, attempt + 1, MaxRewriteRetries);
+                    "Segment {Id} [attempt {Attempt}/{Max}]: CASE A — too long " +
+                    "(actual={Actual:F2}s target={Target:F2}s requiredFactor={Factor:F4}x). " +
+                    "Requesting shorter rewrite…",
+                    ex.SegmentId, attempt, _settings.MaxRetryAttempts,
+                    ex.ActualDuration, ex.TargetDuration, ex.SpeedFactor);
 
-                // Rewrite the script shorter and re-synthesize
+                failedAttempts.Add(new SegmentSynthesisAttempt
+                {
+                    AttemptNumber  = attempt,
+                    Script         = currentScript,
+                    WavBytes       = rawWav,
+                    ActualDuration = ex.ActualDuration,
+                    Delta          = ex.ActualDuration - ex.TargetDuration,
+                });
+
+                if (attempt == _settings.MaxRetryAttempts) break;
+
                 (currentScript, rawWav) = await RewriteAndSynthesizeAsync(
-                    segment, currentScript, aiConfig, voiceOverride, ct);
+                    segment, currentScript, aiConfig, voiceOverride, RewriteDirection.Shorter, ct);
+            }
+            catch (SegmentUnderSizedException ex)
+            {
+                // CASE B — audio is too short even at min slow factor: need a longer script
+                _log.LogWarning(
+                    "Segment {Id} [attempt {Attempt}/{Max}]: CASE B — too short " +
+                    "(actual={Actual:F2}s target={Target:F2}s requiredFactor={Factor:F4}x). " +
+                    "Requesting longer rewrite…",
+                    ex.SegmentId, attempt, _settings.MaxRetryAttempts,
+                    ex.ActualDuration, ex.TargetDuration, ex.SlowFactor);
+
+                failedAttempts.Add(new SegmentSynthesisAttempt
+                {
+                    AttemptNumber  = attempt,
+                    Script         = currentScript,
+                    WavBytes       = rawWav,
+                    ActualDuration = ex.ActualDuration,
+                    Delta          = ex.ActualDuration - ex.TargetDuration,
+                });
+
+                if (attempt == _settings.MaxRetryAttempts) break;
+
+                (currentScript, rawWav) = await RewriteAndSynthesizeAsync(
+                    segment, currentScript, aiConfig, voiceOverride, RewriteDirection.Longer, ct);
             }
         }
 
-        // Unreachable — loop always returns or throws
-        throw new InvalidOperationException($"Segment {segment.Id}: unexpected loop exit.");
+        // ── All retries exhausted ─────────────────────────────────────────────
+        // Select the attempt whose raw audio was closest to the target duration
+        // and apply the best-effort atempo fallback.
+        var best = failedAttempts.MinBy(a => Math.Abs(a.Delta))!;
+
+        _log.LogWarning(
+            "⚠️  Segment {Id}: all {Max} rewrite attempt(s) exhausted. " +
+            "Best attempt was #{Num} (delta={Delta:+0.00;-0.00}s). " +
+            "Applying best-effort fallback atempo.",
+            segment.Id, _settings.MaxRetryAttempts, best.AttemptNumber, best.Delta);
+
+        var fallbackResult = await _normalizationService.ApplyFallbackAsync(
+            best.WavBytes, best.ActualDuration, segment.TargetDuration, segment.Id, ct);
+
+        return (ToSegmentResult(segment, fallbackResult), fallbackResult.WavBytes);
     }
 
-    /// <summary>Calls /rewrite-shorter, then re-synthesizes. Returns (newScript, rawWav).</summary>
+    // ─────────────────────────────────────────────────────────────────────────
+    // LLM rewrite + re-synthesis
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private enum RewriteDirection { Shorter, Longer }
+
     private async Task<(string newScript, byte[] rawWav)> RewriteAndSynthesizeAsync(
         Segment segment,
         string currentScript,
         AiConfigDto aiConfig,
         string? voiceOverride,
+        RewriteDirection rewriteDirection,
         CancellationToken ct)
     {
-        var rewriteRequest = new RewriteShorterRequest
+        int originalWordCount = currentScript.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
+        RewrittenScriptDto rewritten;
+
+        if (rewriteDirection == RewriteDirection.Shorter)
         {
-            OriginalScript = currentScript,
-            TargetDurationSeconds = segment.TargetDuration,
-            AiConfig = aiConfig,
-            Keywords = [],  // keywords were already woven in; preserve meaning, not exact terms
-        };
+            rewritten = await _scriptService.RewriteShorterAsync(new RewriteShorterRequest
+            {
+                OriginalScript        = currentScript,
+                TargetDurationSeconds = segment.TargetDuration,
+                AiConfig              = aiConfig,
+                Keywords              = [],
+            }, ct);
 
-        var rewritten = await _scriptService.RewriteShorterAsync(rewriteRequest, ct);
+            _log.LogInformation(
+                "Segment {Id}: rewritten SHORTER — {Old} → {New} words (word-count limit {Max}).",
+                segment.Id, originalWordCount, rewritten.WordCount, rewritten.MaxWordCount);
+        }
+        else
+        {
+            rewritten = await _scriptService.RewriteLongerAsync(new RewriteLongerRequest
+            {
+                OriginalScript        = currentScript,
+                TargetDurationSeconds = segment.TargetDuration,
+                AiConfig              = aiConfig,
+                Keywords              = [],
+            }, ct);
 
-        _log.LogInformation(
-            "Segment {Id}: rewritten from {Old} → {New} words (limit {Max}).",
-            segment.Id,
-            currentScript.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length,
-            rewritten.WordCount,
-            rewritten.MaxWordCount);
+            _log.LogInformation(
+                "Segment {Id}: rewritten LONGER — {Old} → {New} words (target min {Max}).",
+                segment.Id, originalWordCount, rewritten.WordCount, rewritten.MaxWordCount);
+        }
 
         var newWav = await SynthesizeAsync(segment, rewritten.RewrittenScript, voiceOverride, ct);
         return (rewritten.RewrittenScript, newWav);
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TTS synthesis
+    // ─────────────────────────────────────────────────────────────────────────
 
     private async Task<byte[]> SynthesizeAsync(
         Segment segment,
@@ -198,11 +341,10 @@ public class TtsOrchestrationService : ITtsOrchestrationService
     {
         var request = new SynthesizeRequest
         {
-            Text = scriptText,
+            Text     = scriptText,
             Filename = $"{segment.Id}.wav",
-            // voiceOverride wins when set — ensures consistent voice across all segments
-            Voice = voiceOverride ?? segment.TtsConfig.Voice,
-            Speed = segment.TtsConfig.Speed,
+            Voice    = voiceOverride ?? segment.TtsConfig.Voice,
+            Speed    = segment.TtsConfig.Speed,
         };
 
         try
@@ -215,6 +357,10 @@ public class TtsOrchestrationService : ITtsOrchestrationService
             throw;
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Result mapping
+    // ─────────────────────────────────────────────────────────────────────────
 
     private static SegmentAudioResult ToSegmentResult(Segment segment, AudioNormalizationResult n) =>
         new()

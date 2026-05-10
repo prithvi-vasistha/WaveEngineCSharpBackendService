@@ -100,4 +100,43 @@ public class ScriptGenerationClient : IScriptGenerationService
             result?.WordCount ?? 0, result?.MaxWordCount ?? 0);
         return result!;
     }
+
+    public async Task<RewrittenScriptDto> RewriteLongerAsync(
+        RewriteLongerRequest request,
+        CancellationToken ct = default)
+    {
+        _log.LogInformation(
+            "→ Script POST {BaseAddress}/rewrite-longer  targetDuration={Target}s originalWords={Words}",
+            _http.BaseAddress, request.TargetDurationSeconds,
+            request.OriginalScript?.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length ?? 0);
+
+        HttpResponseMessage response;
+        try
+        {
+            response = await _http.PostAsJsonAsync("/rewrite-longer", request, _jsonOptions, ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Script HTTP call threw {Type} — is the script container running at {Base}?",
+                ex.GetType().Name, _http.BaseAddress);
+            throw;
+        }
+
+        _log.LogInformation("← Script /rewrite-longer response: HTTP {Status}", (int)response.StatusCode);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var error = await response.Content.ReadAsStringAsync(ct);
+            _log.LogError("Script /rewrite-longer error body: {Body}", error);
+            throw new HttpRequestException(
+                $"Script expansion failed ({(int)response.StatusCode}): {error}",
+                null,
+                response.StatusCode);
+        }
+
+        var result = await response.Content.ReadFromJsonAsync<RewrittenScriptDto>(_jsonOptions, ct);
+        _log.LogInformation("← Script /rewrite-longer OK — {Words} words (target min {Max}).",
+            result?.WordCount ?? 0, result?.MaxWordCount ?? 0);
+        return result!;
+    }
 }

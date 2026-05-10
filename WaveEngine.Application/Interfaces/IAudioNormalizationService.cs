@@ -6,9 +6,9 @@ public interface IAudioNormalizationService
 {
     /// <summary>
     /// Measures actual duration then:
-    /// - Does nothing if within 0.2s of target.
-    /// - Applies atempo to speed up if too long (max 1.15x — throws SegmentOverSizedException beyond that).
-    /// - Pads with silence if too short.
+    /// - Does nothing if within ToleranceSeconds of target.
+    /// - Applies atempo &gt; 1.0 to speed up if too long  (max MaxSpeedFactor — throws SegmentOverSizedException beyond that).
+    /// - Applies atempo &lt; 1.0 to slow down if too short (min 1/MaxSpeedFactor — throws SegmentUnderSizedException beyond that).
     /// </summary>
     Task<AudioNormalizationResult> NormalizeAsync(
         byte[] inputWavBytes,
@@ -17,10 +17,11 @@ public interface IAudioNormalizationService
         CancellationToken ct = default);
 
     /// <summary>
-    /// Hard-cap fallback: always applies exactly MaxSpeedFactor (1.15x) atempo.
-    /// Used after all rewrite retries are exhausted. Never throws.
+    /// Best-effort fallback used after all LLM-rewrite retries are exhausted.
+    /// Applies atempo at MaxSpeedFactor (too long) or 1/MaxSpeedFactor (too short).
+    /// Gets the audio as close to the target as the speed-factor cap allows. Never throws.
     /// </summary>
-    Task<AudioNormalizationResult> ApplyHardCapAsync(
+    Task<AudioNormalizationResult> ApplyFallbackAsync(
         byte[] inputWavBytes,
         double actualDurationSeconds,
         double targetDurationSeconds,

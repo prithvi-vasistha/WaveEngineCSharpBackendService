@@ -2,9 +2,10 @@ namespace WaveEngine.Application.DTOs.Audio;
 
 public enum NormalizationAction
 {
-    None,       // Within tolerance — file returned as-is
-    Stretched,  // atempo applied to speed up
-    Padded      // Silence appended to fill target duration
+    None,      // Within tolerance — file returned as-is
+    Stretched, // atempo > 1.0 applied to speed up (too long)
+    Slowed,    // atempo < 1.0 applied to slow down (too short)
+    Fallback   // Best-effort atempo at MaxSpeedFactor after all LLM retries exhausted
 }
 
 public class AudioNormalizationResult
