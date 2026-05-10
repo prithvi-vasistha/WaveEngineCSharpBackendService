@@ -36,7 +36,7 @@ builder.Services.AddControllers()
         // Accept and produce snake_case JSON to match the Python services
         options.JsonSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
         options.JsonSerializerOptions.PropertyNameCaseInsensitive = true;
-        options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter());
+        options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower));
     });
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();

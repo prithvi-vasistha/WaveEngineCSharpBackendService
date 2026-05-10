@@ -15,8 +15,11 @@ public class TtsController : ControllerBase
 {
     private readonly IScriptGenerationService _scriptService;
     private readonly ITtsSynthesisService _synthesisService;
+    private readonly IAudioNormalizationService _normalizationService;
+    private readonly IAudioAssemblyService _assemblyService;
     private readonly ITtsOrchestrationService _orchestrationService;
     private readonly IVideoCompilationService _videoCompilationService;
+    private readonly ISegmentWorkflowService _segmentWorkflowService;
     private readonly ILogger<TtsController> _log;
 
     // Reuse one instance for manual deserialization (compile-video form field)
@@ -24,20 +27,26 @@ public class TtsController : ControllerBase
     {
         PropertyNamingPolicy        = JsonNamingPolicy.SnakeCaseLower,
         PropertyNameCaseInsensitive = true,
-        Converters                  = { new JsonStringEnumConverter() },
+        Converters                  = { new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower) },
     };
 
     public TtsController(
         IScriptGenerationService scriptService,
         ITtsSynthesisService synthesisService,
+        IAudioNormalizationService normalizationService,
+        IAudioAssemblyService assemblyService,
         ITtsOrchestrationService orchestrationService,
         IVideoCompilationService videoCompilationService,
+        ISegmentWorkflowService segmentWorkflowService,
         ILogger<TtsController> log)
     {
         _scriptService           = scriptService;
         _synthesisService        = synthesisService;
+        _normalizationService    = normalizationService;
+        _assemblyService         = assemblyService;
         _orchestrationService    = orchestrationService;
         _videoCompilationService = videoCompilationService;
+        _segmentWorkflowService  = segmentWorkflowService;
         _log                     = log;
     }
 
@@ -114,7 +123,6 @@ public class TtsController : ControllerBase
 
     /// <summary>
     /// Decodes a Base64-encoded WAV from an OrchestrationResult and returns it as a playable audio/wav file.
-    /// Use ?target=final_mix for the complete mixed track, or ?target={segmentId} for a single segment.
     /// </summary>
     [HttpPost("decode-audio")]
     [Produces("audio/wav")]
@@ -146,7 +154,7 @@ public class TtsController : ControllerBase
             if (segment is null)
                 return NotFound(new
                 {
-                    error = $"Segment '{target}' not found.",
+                    error     = $"Segment '{target}' not found.",
                     available = result.SegmentAudio?.Select(s => s.SegmentId).ToArray() ?? [],
                 });
 
@@ -176,7 +184,6 @@ public class TtsController : ControllerBase
 
     /// <summary>
     /// Full pipeline: generate script → synthesize each segment → normalize duration.
-    /// Returns the narration script JSON plus all normalized segment WAVs as Base64.
     /// </summary>
     [HttpPost("orchestrate")]
     [ProducesResponseType(typeof(OrchestrationResult), StatusCodes.Status200OK)]
@@ -191,8 +198,6 @@ public class TtsController : ControllerBase
             request.Script?.ProjectId, request.Script?.Segments?.Count,
             request.AiConfig?.Provider, request.AiConfig?.Model);
 
-        // Validate script.segments up-front — catches the common mistake of sending the
-        // NarrationScript fields at the root level instead of nested under "script".
         if (request.Script?.Segments is not { Count: > 0 })
         {
             _log.LogWarning("POST /orchestrate — rejected: script.segments is empty or missing.");
@@ -204,7 +209,6 @@ public class TtsController : ControllerBase
             });
         }
 
-        // Validate ai_config up-front — it's required if any segment needs a rewrite.
         if (string.IsNullOrWhiteSpace(request.AiConfig?.Provider))
         {
             _log.LogWarning("POST /orchestrate — rejected: ai_config.provider is missing or empty.");
@@ -240,24 +244,12 @@ public class TtsController : ControllerBase
     }
 
     /// <summary>
-    /// Ingests a video file and an OrchestrationResult (the output of /orchestrate), then
-    /// produces a compiled MP4 by muxing the video with the assembled narration track.
-    ///
-    /// The video's original audio is optionally ducked to 15% volume beneath the narration.
-    /// The compiled MP4 is streamed back directly — the temp workspace is deleted after the
-    /// response finishes, without buffering the full file in memory.
-    ///
-    /// Request: multipart/form-data
-    ///   video      — the source video file (mp4, mov, mkv, …) — up to 500 MB
-    ///   masterPlan — the OrchestrationResult JSON produced by /orchestrate
-    ///
-    /// Query params:
-    ///   duckOriginalAudio (bool, default true) — mix video audio at 15% with narration
+    /// Ingests a video file and an OrchestrationResult, then produces a compiled MP4.
     /// </summary>
     [HttpPost("compile-video")]
     [Consumes("multipart/form-data")]
     [Produces("video/mp4")]
-    [RequestSizeLimit(524_288_000)] // 500 MB — must also match Kestrel / FormOptions limits in Program.cs
+    [RequestSizeLimit(524_288_000)]
     [ProducesResponseType(typeof(FileStreamResult), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     public async Task<IActionResult> CompileVideoAsync(
@@ -266,7 +258,6 @@ public class TtsController : ControllerBase
         [FromQuery] bool duckOriginalAudio = true,
         CancellationToken ct = default)
     {
-        // ── Input validation ────────────────────────────────────────────────
         if (video is null || video.Length == 0)
             return BadRequest(new { error = "A non-empty video file is required." });
 
@@ -291,10 +282,6 @@ public class TtsController : ControllerBase
                         "Run /orchestrate first to produce an OrchestrationResult.",
             });
 
-        // ── Workspace setup ─────────────────────────────────────────────────
-        // Workspace is kept alive for the duration of the operation and then
-        // transferred to DeferredDeleteFileStream on success (so cleanup happens
-        // after streaming completes, not before).
         Workspace? workspace = null;
         try
         {
@@ -307,12 +294,10 @@ public class TtsController : ControllerBase
                 "POST /compile-video — workspace={Dir} file='{Name}' size={Size} duck={Duck}",
                 workspace.Directory, video.FileName, video.Length, duckOriginalAudio);
 
-            // ── 1. Save the uploaded video stream to disk ───────────────────
             string videoPath;
             await using (var src = video.OpenReadStream())
                 videoPath = await workspace.SaveStreamAsync(src, $"input{videoExt}", ct);
 
-            // ── 2. Decode narration WAV and save to disk ────────────────────
             byte[] narrationBytes;
             try
             {
@@ -320,39 +305,30 @@ public class TtsController : ControllerBase
             }
             catch (FormatException ex)
             {
-                return BadRequest(new
-                {
-                    error = $"final_mix_wav_base64 is not valid Base64: {ex.Message}",
-                });
+                return BadRequest(new { error = $"final_mix_wav_base64 is not valid Base64: {ex.Message}" });
             }
 
             var narrationWavPath = workspace.GetPath("narration.wav");
             await System.IO.File.WriteAllBytesAsync(narrationWavPath, narrationBytes, ct);
 
-            // ── 3. Determine total narration duration ───────────────────────
             double totalDuration = plan.Script?.Segments?.Count > 0
                 ? (double)plan.Script.Segments.Max(s => s.EndTimeSeconds)
                 : 0;
 
-            // ── 4. Run FFmpeg to produce the compiled MP4 ───────────────────
             var outputPath = workspace.GetPath("output.mp4");
 
             await _videoCompilationService.CompileAsync(
                 videoPath, narrationWavPath, totalDuration, outputPath, duckOriginalAudio, ct);
 
-            _log.LogInformation(
-                "POST /compile-video — FFmpeg done, streaming {Path}", outputPath);
+            _log.LogInformation("POST /compile-video — FFmpeg done, streaming {Path}", outputPath);
 
-            // ── 5. Stream result — transfer workspace ownership to the stream ─
-            // DeferredDeleteFileStream deletes workspace.Directory after the
-            // response body has been fully sent, so we must NOT dispose workspace here.
-            var stream = new DeferredDeleteFileStream(outputPath, workspace.Directory);
-            workspace  = null; // prevent cleanup in finally
+            var stream    = new DeferredDeleteFileStream(outputPath, workspace.Directory);
+            workspace     = null;
 
             var projectId = plan.Script?.ProjectId ?? "output";
             return new FileStreamResult(stream, "video/mp4")
             {
-                FileDownloadName    = $"{projectId}_final.mp4",
+                FileDownloadName      = $"{projectId}_final.mp4",
                 EnableRangeProcessing = true,
             };
         }
@@ -364,9 +340,219 @@ public class TtsController : ControllerBase
         }
         finally
         {
-            // Only reached on error paths (workspace is null on success)
             if (workspace is not null)
                 await workspace.DisposeAsync();
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Human-in-the-loop endpoints
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Synthesizes a single segment and normalizes its duration WITHOUT automatic rewriting.
+    /// Returns Ok, OverLimit (hard-capped audio), or UnderLimit (raw audio + gap size).
+    /// </summary>
+    [HttpPost("synthesize-segment")]
+    [ProducesResponseType(typeof(SynthesizeSegmentResponse), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> SynthesizeSegmentAsync(
+        [FromBody] SynthesizeSegmentRequest request,
+        CancellationToken ct)
+    {
+        var seg = request.Segment;
+
+        if (seg is null || string.IsNullOrWhiteSpace(seg.Id))
+            return BadRequest(new { error = "segment.id is required." });
+
+        if (string.IsNullOrWhiteSpace(seg.Script))
+            return BadRequest(new { error = "segment.script is required." });
+
+        _log.LogInformation(
+            "POST /synthesize-segment — id={Id} target={Target:F1}s",
+            seg.Id, seg.TargetDuration);
+
+        try
+        {
+            var result = await _segmentWorkflowService.SynthesizeAsync(request, ct);
+            return Ok(result);
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode.HasValue)
+        {
+            return StatusCode((int)ex.StatusCode.Value, new { error = ex.Message });
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "POST /synthesize-segment — UNHANDLED {Type}: {Message}",
+                ex.GetType().Name, ex.Message);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Rewrites an over-limit segment script shorter so it fits the target duration.
+    /// </summary>
+    [HttpPost("rewrite-segment")]
+    [ProducesResponseType(typeof(RewrittenScriptDto), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> RewriteSegmentAsync(
+        [FromBody] RewriteShorterRequest request,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(request.OriginalScript))
+            return BadRequest(new { error = "original_script is required." });
+
+        if (request.TargetDurationSeconds <= 0)
+            return BadRequest(new { error = "target_duration_seconds must be positive." });
+
+        if (string.IsNullOrWhiteSpace(request.AiConfig?.Provider))
+            return BadRequest(new { error = "ai_config.provider is required." });
+
+        if (string.IsNullOrWhiteSpace(request.AiConfig?.ApiKey))
+            return BadRequest(new { error = "ai_config.api_key is required." });
+
+        _log.LogInformation(
+            "POST /rewrite-segment — target={Target:F1}s words={Words} provider={Provider}",
+            request.TargetDurationSeconds,
+            request.OriginalScript.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length,
+            request.AiConfig.Provider);
+
+        try
+        {
+            var result = await _scriptService.RewriteShorterAsync(request, ct);
+            _log.LogInformation(
+                "POST /rewrite-segment — OK: {Old} → {New} words",
+                request.OriginalScript.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length,
+                result.WordCount);
+            return Ok(result);
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode.HasValue)
+        {
+            return StatusCode((int)ex.StatusCode.Value, new { error = ex.Message });
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "POST /rewrite-segment — UNHANDLED {Type}: {Message}",
+                ex.GetType().Name, ex.Message);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Rewrites an under-limit segment script longer to better fill the target duration.
+    /// </summary>
+    [HttpPost("rewrite-longer")]
+    [ProducesResponseType(typeof(RewrittenScriptDto), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> RewriteLongerAsync(
+        [FromBody] RewriteShorterRequest request,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(request.OriginalScript))
+            return BadRequest(new { error = "original_script is required." });
+
+        if (request.TargetDurationSeconds <= 0)
+            return BadRequest(new { error = "target_duration_seconds must be positive." });
+
+        if (string.IsNullOrWhiteSpace(request.AiConfig?.Provider))
+            return BadRequest(new { error = "ai_config.provider is required." });
+
+        if (string.IsNullOrWhiteSpace(request.AiConfig?.ApiKey))
+            return BadRequest(new { error = "ai_config.api_key is required." });
+
+        _log.LogInformation(
+            "POST /rewrite-longer — target={Target:F1}s words={Words} provider={Provider}",
+            request.TargetDurationSeconds,
+            request.OriginalScript.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length,
+            request.AiConfig.Provider);
+
+        try
+        {
+            var result = await _scriptService.RewriteLongerAsync(request, ct);
+            _log.LogInformation(
+                "POST /rewrite-longer — OK: {Old} → {New} words",
+                request.OriginalScript.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length,
+                result.WordCount);
+            return Ok(result);
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode.HasValue)
+        {
+            return StatusCode((int)ex.StatusCode.Value, new { error = ex.Message });
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "POST /rewrite-longer — UNHANDLED {Type}: {Message}",
+                ex.GetType().Name, ex.Message);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Assembles pre-synthesized segment WAVs into a single mixed audio track.
+    /// </summary>
+    [HttpPost("assemble")]
+    [ProducesResponseType(typeof(AssembleResponse), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> AssembleAsync(
+        [FromBody] AssembleRequest request,
+        CancellationToken ct)
+    {
+        if (request.Segments is not { Count: > 0 })
+            return BadRequest(new { error = "segments is empty or missing." });
+
+        _log.LogInformation(
+            "POST /assemble — {Count} segments bgMusic='{Track}'",
+            request.Segments.Count,
+            request.BackgroundMusic?.TrackFileName ?? "none");
+
+        var inputs = new List<SegmentAudioAssemblyInput>(request.Segments.Count);
+        for (int i = 0; i < request.Segments.Count; i++)
+        {
+            var s = request.Segments[i];
+            if (string.IsNullOrWhiteSpace(s.WavBase64))
+                return BadRequest(new { error = $"segments[{i}].wav_base64 is empty." });
+
+            byte[] wavBytes;
+            try { wavBytes = Convert.FromBase64String(s.WavBase64); }
+            catch (FormatException ex)
+            {
+                return BadRequest(new
+                {
+                    error = $"segments[{i}].wav_base64 is not valid Base64: {ex.Message}",
+                });
+            }
+
+            inputs.Add(new SegmentAudioAssemblyInput
+            {
+                SegmentId        = s.SegmentId,
+                StartTimeSeconds = s.StartTimeSeconds,
+                WavBytes         = wavBytes,
+            });
+        }
+
+        double totalDuration = request.VideoDurationSeconds is > 0
+            ? request.VideoDurationSeconds.Value
+            : request.Segments.Max(s => s.EndTimeSeconds);
+
+        _log.LogInformation("POST /assemble — totalDuration={Duration:F2}s", totalDuration);
+
+        try
+        {
+            var finalMixWav = await _assemblyService.AssembleAsync(
+                inputs, request.BackgroundMusic, totalDuration, ct);
+
+            _log.LogInformation("POST /assemble — OK, {Bytes} bytes", finalMixWav.Length);
+
+            return Ok(new AssembleResponse
+            {
+                FinalMixWavBase64 = Convert.ToBase64String(finalMixWav),
+            });
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "POST /assemble — UNHANDLED {Type}: {Message}",
+                ex.GetType().Name, ex.Message);
+            throw;
         }
     }
 }

@@ -3,6 +3,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using WaveEngine.Application.Interfaces;
 using WaveEngine.Infrastructure.HttpClients;
+using WaveEngine.Infrastructure.Persistence;
 using WaveEngine.Infrastructure.Services;
 
 namespace WaveEngine.Infrastructure;
@@ -32,7 +33,14 @@ public static class ServiceExtensions
         services.AddSingleton<IAudioNormalizationService, AudioNormalizationService>();
         services.AddSingleton<IAudioAssemblyService, AudioAssemblyService>();
         services.AddSingleton<IVideoCompilationService, VideoCompilationService>();
+        services.AddSingleton<ISegmentWorkflowService, SegmentWorkflowService>();
         services.AddScoped<ITtsOrchestrationService, TtsOrchestrationService>();
+
+        // ── Job orchestration ─────────────────────────────────────────────────
+        // Singleton: owns the on-disk job store and in-memory SSE channels.
+        services.AddSingleton<IJobStore, JsonFileJobStore>();
+        // Singleton: owns the bounded concurrency semaphore shared across all jobs.
+        services.AddSingleton<IJobOrchestrator, JobOrchestrator>();
 
         // Configure FFMpegCore binary path (override via config for non-PATH installs)
         var ffmpegPath = configuration["FFmpeg:BinaryFolder"];
