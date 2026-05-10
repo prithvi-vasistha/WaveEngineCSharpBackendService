@@ -1,7 +1,10 @@
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using WaveEngine.Application.DTOs.Audio;
+using WaveEngine.Application.DTOs.Jobs;
 using WaveEngine.Application.DTOs.Pipeline;
 using WaveEngine.Application.Interfaces;
+using WaveEngine.Domain.Entities;
 
 namespace WaveEngine.Infrastructure.Services;
 
@@ -12,9 +15,12 @@ namespace WaveEngine.Infrastructure.Services;
 ///   Phase 3 — Audio assembly        (FFmpeg — segment mix + optional background music)
 ///   Phase 4 — Video compilation     (FFmpeg — mux video with assembled narration)
 ///
-/// The compiled MP4 is written to a temporary workspace directory.
-/// The caller (PipelineController) is responsible for streaming the file and
-/// deleting <see cref="PipelineVideoOutput.WorkspaceDirectory"/> after streaming completes.
+/// Progress is reported via the optional IProgress callback at each milestone:
+///   0 %  → job created (set by the controller before calling this method)
+///  15 %  → script ready           (Phase 1 complete)
+///  15–85% → per-segment synthesis  (Phase 2, proportional)
+///  87 %  → audio assembled        (Phase 3 complete)
+///  100 % → video compiled         (Phase 4 complete)
 /// </summary>
 public class PipelineOrchestrationService : IPipelineOrchestrationService
 {
@@ -22,6 +28,11 @@ public class PipelineOrchestrationService : IPipelineOrchestrationService
     private readonly ITtsOrchestrationService _ttsOrchestrationService;
     private readonly IVideoCompilationService _videoCompilationService;
     private readonly ILogger<PipelineOrchestrationService> _log;
+
+    private static readonly JsonSerializerOptions _snakeCaseOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+    };
 
     public PipelineOrchestrationService(
         IScriptGenerationService scriptService,
@@ -39,6 +50,7 @@ public class PipelineOrchestrationService : IPipelineOrchestrationService
         Stream videoStream,
         string videoFileName,
         ExecutePipelineRequest request,
+        IProgress<JobProgressUpdate>? progress = null,
         CancellationToken ct = default)
     {
         var workspaceDir = Path.Combine(
@@ -53,14 +65,33 @@ public class PipelineOrchestrationService : IPipelineOrchestrationService
         {
             // ── Phase 1: Script generation ────────────────────────────────────
             _log.LogInformation("Pipeline [1/4]: generating narration script…");
+
+            progress?.Report(new JobProgressUpdate(5, "AI is writing your narration script…", JobStatus.Scripting));
+
             var script = await _scriptService.GetMasterPlanAsync(request.ScriptRequest, ct);
 
             _log.LogInformation(
                 "Pipeline [1/4]: script ready — projectId={Id} segments={Count}",
                 script.ProjectId, script.Segments?.Count ?? 0);
 
+            int totalSegments = script.Segments?.Count ?? 1;
+            progress?.Report(new JobProgressUpdate(
+                15,
+                $"Script ready — synthesizing {totalSegments} voice segment{(totalSegments == 1 ? "" : "s")}…",
+                JobStatus.Synthesizing));
+
             // ── Phase 2 + 3: TTS synthesis loop + audio assembly ─────────────
             _log.LogInformation("Pipeline [2-3/4]: synthesizing segments and assembling audio…");
+
+            // Map per-segment completions to the 15–85 % range
+            var segmentProgress = new Progress<(int Completed, int Total)>(tuple =>
+            {
+                int pct = 15 + (int)(70.0 * tuple.Completed / Math.Max(tuple.Total, 1));
+                progress?.Report(new JobProgressUpdate(
+                    pct,
+                    $"Synthesizing segment {tuple.Completed} of {tuple.Total}…",
+                    JobStatus.Synthesizing));
+            });
 
             var orchestrateRequest = new OrchestrateRequest
             {
@@ -68,22 +99,21 @@ public class PipelineOrchestrationService : IPipelineOrchestrationService
                 AiConfig        = request.ScriptRequest.AiConfig,
                 BackgroundMusic = request.BackgroundMusic,
                 VoiceOverride   = request.VoiceOverride,
-                // Let the orchestrator use segment-based total duration;
-                // the actual video duration is unknown until we probe it.
                 VideoDurationSeconds = null,
             };
 
             var orchestrationResult = await _ttsOrchestrationService.OrchestrateAsync(
-                orchestrateRequest, ct);
+                orchestrateRequest, segmentProgress, ct);
 
             _log.LogInformation(
-                "Pipeline [2-3/4]: audio ready — {Count} segments, final mix assembled.",
+                "Pipeline [2-3/4]: audio ready — {Count} segments assembled.",
                 orchestrationResult.SegmentAudio?.Count ?? 0);
+
+            progress?.Report(new JobProgressUpdate(87, "Audio assembled — compiling video…", JobStatus.Stitching));
 
             // ── Phase 4: Video compilation ─────────────────────────────────────
             _log.LogInformation("Pipeline [4/4]: compiling video with narration track…");
 
-            // Save uploaded video to workspace
             var videoExt = Path.GetExtension(videoFileName).ToLowerInvariant();
             if (string.IsNullOrEmpty(videoExt)) videoExt = ".mp4";
             var videoPath = Path.Combine(workspaceDir, $"input{videoExt}");
@@ -91,12 +121,10 @@ public class PipelineOrchestrationService : IPipelineOrchestrationService
             await using (var fs = File.Create(videoPath))
                 await videoStream.CopyToAsync(fs, ct);
 
-            // Decode narration WAV
             var narrationBytes = Convert.FromBase64String(orchestrationResult.FinalMixWavBase64);
             var narrationWavPath = Path.Combine(workspaceDir, "narration.wav");
             await File.WriteAllBytesAsync(narrationWavPath, narrationBytes, ct);
 
-            // Calculate narration duration for FFmpeg
             double totalDuration = script.Segments is { Count: > 0 }
                 ? (double)script.Segments.Max(s => s.EndTimeSeconds)
                 : 0;
@@ -107,19 +135,18 @@ public class PipelineOrchestrationService : IPipelineOrchestrationService
                 videoPath, narrationWavPath, totalDuration, outputPath,
                 request.DuckOriginalAudio, ct);
 
-            _log.LogInformation(
-                "Pipeline [4/4]: compilation complete — output={Path}", outputPath);
+            _log.LogInformation("Pipeline [4/4]: compilation complete — output={Path}", outputPath);
 
             return new PipelineVideoOutput
             {
-                VideoPath        = outputPath,
+                VideoPath          = outputPath,
                 WorkspaceDirectory = workspaceDir,
-                ProjectId        = script.ProjectId,
+                ProjectId          = script.ProjectId,
+                Script             = script,
             };
         }
         catch (Exception ex)
         {
-            // Clean up workspace on failure — the caller never gets a chance to
             _log.LogError(ex, "Pipeline: failed. Cleaning up workspace {Dir}.", workspaceDir);
             try { Directory.Delete(workspaceDir, recursive: true); } catch { /* best-effort */ }
             throw;

@@ -1,9 +1,11 @@
 using FFMpegCore;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using WaveEngine.Application.Interfaces;
 using WaveEngine.Application.Settings;
 using WaveEngine.Infrastructure.HttpClients;
+using WaveEngine.Infrastructure.Persistence;
 using WaveEngine.Infrastructure.Services;
 
 namespace WaveEngine.Infrastructure;
@@ -14,8 +16,15 @@ public static class ServiceExtensions
         this IServiceCollection services,
         IConfiguration configuration)
     {
+        // ── SQLite job-persistence store ──────────────────────────────────────
+        services.AddDbContext<WaveEngineDbContext>(options =>
+            options.UseSqlite(
+                configuration.GetConnectionString("DefaultConnection")
+                ?? "Data Source=waveengine_jobs.db"));
+
+        services.AddScoped<IJobRepository, JobRepository>();
+
         // ── Strongly-typed orchestration settings ─────────────────────────────
-        // MaxRetryAttempts, ToleranceSeconds, MaxSpeedFactor
         services.Configure<OrchestrationSettings>(
             configuration.GetSection("OrchestrationSettings"));
 

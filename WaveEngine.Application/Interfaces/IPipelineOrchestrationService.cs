@@ -1,3 +1,4 @@
+using WaveEngine.Application.DTOs.Jobs;
 using WaveEngine.Application.DTOs.Pipeline;
 
 namespace WaveEngine.Application.Interfaces;
@@ -9,8 +10,8 @@ namespace WaveEngine.Application.Interfaces;
 ///   3. Audio assembly (FFmpeg)
 ///   4. Video compilation (FFmpeg)
 ///
-/// Returns a <see cref="PipelineVideoOutput"/> pointing to the compiled MP4 on disk.
-/// The caller is responsible for streaming the file and deleting the workspace directory.
+/// Reports progress through the optional <paramref name="progress"/> callback so the
+/// caller can persist milestone updates without coupling the service to the job store.
 /// </summary>
 public interface IPipelineOrchestrationService
 {
@@ -18,5 +19,6 @@ public interface IPipelineOrchestrationService
         Stream videoStream,
         string videoFileName,
         ExecutePipelineRequest request,
+        IProgress<JobProgressUpdate>? progress = null,
         CancellationToken ct = default);
 }

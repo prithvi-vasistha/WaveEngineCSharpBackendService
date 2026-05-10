@@ -222,7 +222,7 @@ public class TtsController : ControllerBase
 
         try
         {
-            var result = await _orchestrationService.OrchestrateAsync(request, ct);
+            var result = await _orchestrationService.OrchestrateAsync(request, segmentProgress: null, ct);
             _log.LogInformation("POST /orchestrate — OK, {Count} segments processed.", result.SegmentAudio?.Count ?? 0);
             return Ok(result);
         }

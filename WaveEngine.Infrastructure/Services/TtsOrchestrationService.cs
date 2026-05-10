@@ -38,6 +38,7 @@ public class TtsOrchestrationService : ITtsOrchestrationService
 
     public async Task<OrchestrationResult> OrchestrateAsync(
         OrchestrateRequest request,
+        IProgress<(int Completed, int Total)>? segmentProgress = null,
         CancellationToken ct = default)
     {
         var script = request.Script;
@@ -48,11 +49,12 @@ public class TtsOrchestrationService : ITtsOrchestrationService
                 "Ensure the NarrationScript is nested under the \"script\" key in the request body.");
 
         int parallelism = Math.Max(1, _settings.MaxTtsParallelism);
+        int totalSegments = script.Segments.Count;
 
         _log.LogInformation(
             "Orchestration: synthesizing {Count} segments for project '{Id}' " +
             "(tolerance=±{Tol:F2}s, maxSpeedFactor={Factor:F2}x, maxRetries={Retries}, parallelism={P})",
-            script.Segments.Count, script.ProjectId,
+            totalSegments, script.ProjectId,
             _settings.ToleranceSeconds, _settings.MaxSpeedFactor,
             _settings.MaxRetryAttempts, parallelism);
 
@@ -62,21 +64,23 @@ public class TtsOrchestrationService : ITtsOrchestrationService
                 request.VoiceOverride);
 
         // ── Phase 1: Parallel segment synthesis ───────────────────────────────
-        //
-        // A linked CTS lets any segment with a FATAL error cancel all siblings.
-        // Non-fatal errors (duration validation failures after all retries) are
-        // swallowed inside ProcessSegmentAsync — they never reach this level.
         using var fatalCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         using var semaphore = new SemaphoreSlim(parallelism, parallelism);
 
-        // Allocate result slots so we can preserve segment ordering.
-        var orderedResults   = new (SegmentAudioResult Dto, byte[] RawWav)[script.Segments.Count];
-        var assemblyInputs   = new SegmentAudioAssemblyInput[script.Segments.Count];
+        var orderedResults  = new (SegmentAudioResult Dto, byte[] RawWav)[totalSegments];
+        var assemblyInputs  = new SegmentAudioAssemblyInput[totalSegments];
+        int completedCount  = 0;
 
         var tasks = script.Segments.Select((segment, index) =>
             SynthesizeWithSemaphoreAsync(
                 semaphore, segment, index, request.AiConfig, request.VoiceOverride,
-                orderedResults, assemblyInputs, fatalCts, fatalCts.Token));
+                orderedResults, assemblyInputs, fatalCts,
+                onComplete: () =>
+                {
+                    int n = Interlocked.Increment(ref completedCount);
+                    segmentProgress?.Report((n, totalSegments));
+                },
+                fatalCts.Token));
 
         try
         {
@@ -84,8 +88,6 @@ public class TtsOrchestrationService : ITtsOrchestrationService
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            // Triggered by fatalCts — a segment threw a fatal exception.
-            // The real exception was already logged inside the task.
             throw new InvalidOperationException(
                 "One or more segment synthesis tasks failed with a fatal error. " +
                 "The pipeline has been aborted.");
@@ -116,8 +118,7 @@ public class TtsOrchestrationService : ITtsOrchestrationService
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Semaphore wrapper — acquires a slot, runs the segment, releases the slot.
-    // Fatal exceptions (not duration-validation failures) cancel all siblings.
+    // Semaphore wrapper
     // ─────────────────────────────────────────────────────────────────────────
 
     private async Task SynthesizeWithSemaphoreAsync(
@@ -129,6 +130,7 @@ public class TtsOrchestrationService : ITtsOrchestrationService
         (SegmentAudioResult Dto, byte[] RawWav)[] results,
         SegmentAudioAssemblyInput[] assemblyInputs,
         CancellationTokenSource fatalCts,
+        Action onComplete,
         CancellationToken ct)
     {
         await semaphore.WaitAsync(ct);
@@ -144,20 +146,18 @@ public class TtsOrchestrationService : ITtsOrchestrationService
                 StartTimeSeconds = segment.StartTimeSeconds,
                 WavBytes         = rawWav,
             };
+
+            onComplete();
         }
         catch (OperationCanceledException)
         {
-            // Propagate cancellation (either caller or sibling fatal error).
             throw;
         }
         catch (Exception ex)
         {
-            // Fatal synthesis error — cancel all other running/pending segments.
             _log.LogError(ex,
-                "Segment {Id}: FATAL error during synthesis. " +
-                "Cancelling all remaining segments.",
+                "Segment {Id}: FATAL error during synthesis. Cancelling all remaining segments.",
                 segment.Id);
-
             fatalCts.Cancel();
             throw;
         }
@@ -168,19 +168,9 @@ public class TtsOrchestrationService : ITtsOrchestrationService
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Per-segment synthesis loop
+    // Per-segment synthesis + rewrite loop
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Synthesizes one segment, applies audio normalization (atempo up to MaxSpeedFactor),
-    /// and runs the LLM-rewrite retry loop:
-    ///   CASE A (too long)  → RewriteShorterAsync → re-synthesize
-    ///   CASE B (too short) → RewriteLongerAsync  → re-synthesize
-    ///
-    /// This method ALWAYS returns a result (never throws for duration-validation failures).
-    /// After MaxRetryAttempts the attempt with the smallest absolute delta is used
-    /// with a best-effort fallback atempo. Any other exception propagates as fatal.
-    /// </summary>
     private async Task<(SegmentAudioResult Dto, byte[] RawWav)> ProcessSegmentAsync(
         Segment segment,
         AiConfigDto aiConfig,
@@ -195,7 +185,6 @@ public class TtsOrchestrationService : ITtsOrchestrationService
         var currentScript = segment.Script;
         var rawWav = await SynthesizeAsync(segment, currentScript, voiceOverride, ct);
 
-        // Tracks every attempt that failed normalization so we can select the best one.
         var failedAttempts = new List<SegmentSynthesisAttempt>();
 
         for (int attempt = 0; attempt <= _settings.MaxRetryAttempts; attempt++)
@@ -214,7 +203,6 @@ public class TtsOrchestrationService : ITtsOrchestrationService
             }
             catch (SegmentOverSizedException ex)
             {
-                // CASE A — audio is too long even at MaxSpeedFactor: need a shorter script
                 _log.LogWarning(
                     "Segment {Id} [attempt {Attempt}/{Max}]: CASE A — too long " +
                     "(actual={Actual:F2}s target={Target:F2}s requiredFactor={Factor:F4}x). " +
@@ -238,7 +226,6 @@ public class TtsOrchestrationService : ITtsOrchestrationService
             }
             catch (SegmentUnderSizedException ex)
             {
-                // CASE B — audio is too short even at min slow factor: need a longer script
                 _log.LogWarning(
                     "Segment {Id} [attempt {Attempt}/{Max}]: CASE B — too short " +
                     "(actual={Actual:F2}s target={Target:F2}s requiredFactor={Factor:F4}x). " +
@@ -262,9 +249,6 @@ public class TtsOrchestrationService : ITtsOrchestrationService
             }
         }
 
-        // ── All retries exhausted ─────────────────────────────────────────────
-        // Select the attempt whose raw audio was closest to the target duration
-        // and apply the best-effort atempo fallback.
         var best = failedAttempts.MinBy(a => Math.Abs(a.Delta))!;
 
         _log.LogWarning(

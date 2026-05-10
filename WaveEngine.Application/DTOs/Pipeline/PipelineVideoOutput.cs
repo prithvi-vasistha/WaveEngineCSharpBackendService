@@ -1,9 +1,12 @@
+using WaveEngine.Domain.Entities;
+
 namespace WaveEngine.Application.DTOs.Pipeline;
 
 /// <summary>
 /// Returned by IPipelineOrchestrationService.ExecuteAsync.
-/// Contains the path to the compiled MP4 and the workspace directory that should
-/// be deleted after the file has been streamed to the client.
+/// Contains the path to the compiled MP4, the workspace directory, and the
+/// full NarrationScript so callers can persist the master-plan without
+/// re-fetching it.
 /// </summary>
 public class PipelineVideoOutput
 {
@@ -12,10 +15,13 @@ public class PipelineVideoOutput
 
     /// <summary>
     /// Temporary workspace directory that owns the output file.
-    /// The controller must delete this directory after streaming completes.
+    /// Kept alive until the client downloads the video; deleted afterwards.
     /// </summary>
     public string WorkspaceDirectory { get; init; } = string.Empty;
 
     /// <summary>Project identifier sourced from the generated NarrationScript.</summary>
     public string ProjectId { get; init; } = string.Empty;
+
+    /// <summary>The full narration script produced in Phase 1. Persisted as JSON by the job store.</summary>
+    public NarrationScript Script { get; init; } = new();
 }
