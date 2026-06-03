@@ -125,6 +125,19 @@ public class PipelineOrchestrationService : IPipelineOrchestrationService
             var narrationWavPath = Path.Combine(workspaceDir, "narration.wav");
             await File.WriteAllBytesAsync(narrationWavPath, narrationBytes, ct);
 
+            // Persist individual segment WAVs so SegmentRegenerationService can do partial re-renders.
+            foreach (var segResult in orchestrationResult.SegmentAudio)
+            {
+                var segWavBytes = Convert.FromBase64String(segResult.WavBase64);
+                await File.WriteAllBytesAsync(
+                    Path.Combine(workspaceDir, $"{segResult.SegmentId}.wav"), segWavBytes, ct);
+            }
+
+            // Persist the pipeline config so regeneration can re-use bg music, voice override, etc.
+            var configJson = JsonSerializer.Serialize(request, _snakeCaseOptions);
+            await File.WriteAllTextAsync(
+                Path.Combine(workspaceDir, "pipeline_config.json"), configJson, ct);
+
             double totalDuration = script.Segments is { Count: > 0 }
                 ? (double)script.Segments.Max(s => s.EndTimeSeconds)
                 : 0;

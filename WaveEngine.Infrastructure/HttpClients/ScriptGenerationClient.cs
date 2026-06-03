@@ -139,4 +139,44 @@ public class ScriptGenerationClient : IScriptGenerationService
             result?.WordCount ?? 0, result?.MaxWordCount ?? 0);
         return result!;
     }
+
+    public async Task<RewrittenScriptDto> RefineAsync(
+        RefineScriptRequest request,
+        CancellationToken ct = default)
+    {
+        _log.LogInformation(
+            "→ Script POST {BaseAddress}/refine-segment  targetDuration={Target}s instruction='{Instruction}'",
+            _http.BaseAddress, request.TargetDurationSeconds,
+            request.UserInstruction.Length > 60
+                ? request.UserInstruction[..60] + "…"
+                : request.UserInstruction);
+
+        HttpResponseMessage response;
+        try
+        {
+            response = await _http.PostAsJsonAsync("/refine-segment", request, _jsonOptions, ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Script HTTP call threw {Type} — is the script container running at {Base}?",
+                ex.GetType().Name, _http.BaseAddress);
+            throw;
+        }
+
+        _log.LogInformation("← Script /refine-segment response: HTTP {Status}", (int)response.StatusCode);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var error = await response.Content.ReadAsStringAsync(ct);
+            _log.LogError("Script /refine-segment error body: {Body}", error);
+            throw new HttpRequestException(
+                $"Script refinement failed ({(int)response.StatusCode}): {error}",
+                null,
+                response.StatusCode);
+        }
+
+        var result = await response.Content.ReadFromJsonAsync<RewrittenScriptDto>(_jsonOptions, ct);
+        _log.LogInformation("← Script /refine-segment OK — {Words} words.", result?.WordCount ?? 0);
+        return result!;
+    }
 }

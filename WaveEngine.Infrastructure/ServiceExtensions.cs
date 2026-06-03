@@ -51,6 +51,8 @@ public static class ServiceExtensions
         services.AddSingleton<IVideoCompilationService, VideoCompilationService>();
         services.AddScoped<ITtsOrchestrationService, TtsOrchestrationService>();
         services.AddScoped<IPipelineOrchestrationService, PipelineOrchestrationService>();
+        services.AddScoped<ISegmentRegenerationService, SegmentRegenerationService>();
+        services.AddScoped<ISegmentMoveService, SegmentMoveService>();
 
         // ── FFMpegCore binary path ────────────────────────────────────────────
         var ffmpegPath = configuration["FFmpeg:BinaryFolder"];

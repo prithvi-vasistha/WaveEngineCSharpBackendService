@@ -18,4 +18,10 @@ public interface IScriptGenerationService
     /// Asks the LLM to expand the script to fill the target duration.
     /// </summary>
     Task<RewrittenScriptDto> RewriteLongerAsync(RewriteLongerRequest request, CancellationToken ct = default);
+
+    /// <summary>
+    /// Post-generation edit: revise a segment script according to the user's instruction
+    /// while honoring the target duration timing constraint.
+    /// </summary>
+    Task<RewrittenScriptDto> RefineAsync(RefineScriptRequest request, CancellationToken ct = default);
 }
